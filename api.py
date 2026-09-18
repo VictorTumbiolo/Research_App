@@ -2,7 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from typing import List
 from models import UserQuery
 import rag
-from rag import paper_already_chunked
+
 
 router = APIRouter()
 
@@ -21,10 +21,11 @@ async def ask(query: UserQuery):
 @router.post("/papers")
 async def upload_papers(files: List[UploadFile] = File(...)):
     results = []
+    MAX_PAGES = 15
 
     for file in files:
-
-        if ( rag.paper_already_chunked(file.filename) ):
+        # Avoid double chunking
+        if rag.paper_already_chunked(file.filename):
             results.append({
                 "filename": file.filename,
                 "num_chunks": 0,
@@ -33,6 +34,17 @@ async def upload_papers(files: List[UploadFile] = File(...)):
             continue
 
         contents = await file.read()
+        page_count = rag.get_page_count(contents)
+        # Limit page length before chunkjing
+        if page_count > MAX_PAGES:
+            results.append({
+                "filename": file.filename,
+                "num_chunks": 0,
+                "status": "rejected_too_long",
+                "page_count": page_count,
+            })
+            continue
+
         full_text = rag.extract_full_text(contents)
         chunks = rag.chunk_text(full_text)
 
@@ -48,6 +60,8 @@ async def upload_papers(files: List[UploadFile] = File(...)):
 
     return {"papers": results}
 
+# Test enpoint for personal testing
+# isolates backend issues from qdrant cloud or claude api issuies
 @router.post("/test")
 async def test():
     return {"test": "test"}
