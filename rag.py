@@ -21,31 +21,25 @@ import os
 load_dotenv()
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Prod / Local setup
 # qdrant = QdrantClient(host="localhost", port=6333)
 qdrant = QdrantClient(
     url=os.environ["QDRANT_URL"],
     api_key=os.environ["QDRANT_API_KEY"],
 )
+
 claude_client = anthropic.Anthropic()
 
 COLLECTION_NAME = "paper_chunks"
-TOP_K = 20
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
 HISTORY_EXCHANGES = 5
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 1
+MAX_CANDIDATE_CHUNKS = 500
+TARGET_FRACTION = 0.33
 
-
-
-# if not qdrant.collection_exists(COLLECTION_NAME):
-#     qdrant.create_collection(
-#         collection_name=COLLECTION_NAME,
-#         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-#     )
-
-if not qdrant.collection_exists(COLLECTION_NAME):
-    qdrant.create_collection(...)
-
+# Payl;oad
 qdrant.create_payload_index(
     collection_name=COLLECTION_NAME,
     field_name="filename",
@@ -63,6 +57,7 @@ def store_chunks(filename: str, chunks: list[str]):
                 "filename": filename,
                 "chunk_index": i,
                 "text": chunk,
+                "tokens": count_tokens(chunk),  # computed once, here
             },
         )
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
@@ -70,6 +65,19 @@ def store_chunks(filename: str, chunks: list[str]):
 
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
+
+def count_tokens(text: str) -> int:
+    result = claude_client.messages.count_tokens(
+        model=CLAUDE_MODEL,
+        messages=[{"role": "user", "content": text}],
+    )
+    return result.input_tokens
+
+def get_page_count(pdf_bytes: bytes) -> int:
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    count = len(doc)
+    doc.close()
+    return count
 
 def extract_abstract(pdf_bytes: bytes) -> str:
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -104,7 +112,7 @@ def chunk_text(text: str) -> list[str]:
 
 
 
-def retrieve_chunks(question: str, filename: str, top_k: int = TOP_K) -> list[str]:
+def retrieve_chunks(question: str, filename: str, target_fraction: float = TARGET_FRACTION) -> dict:
     query_vector = embedding_model.encode(question).tolist()
 
     results = qdrant.query_points(
@@ -113,11 +121,26 @@ def retrieve_chunks(question: str, filename: str, top_k: int = TOP_K) -> list[st
         query_filter=Filter(
             must=[FieldCondition(key="filename", match=MatchValue(value=filename))]
         ),
-        limit=top_k,
+        limit=MAX_CANDIDATE_CHUNKS,
         with_payload=True,
     ).points
 
-    return [point.payload["text"] for point in results]
+    if not results:
+        return {"chunks": [], "tokens_used": 0, "total_tokens": 0}
+
+    total_tokens = sum(point.payload["tokens"] for point in results)
+    target_tokens = int(total_tokens * target_fraction)
+
+    selected = []
+    running_tokens = 0
+
+    for point in results:
+        selected.append(point.payload["text"])
+        running_tokens += point.payload["tokens"]
+        if running_tokens >= target_tokens:
+            break
+
+    return {"chunks": selected, "tokens_used": running_tokens, "total_tokens": total_tokens}
 
 def paper_already_chunked(filename: str) -> bool:
     results, _ = qdrant.scroll(
@@ -181,6 +204,8 @@ def build_messages(question: str, history: List[ChatTurn]) -> list[dict]:
 def run_conversation(question: str, history: List[ChatTurn], filename: str) -> dict:
     messages = build_messages(question, history)
     searches: list[str] = []
+    tokens_used_total = 0
+    paper_total_tokens = 0
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = claude_client.messages.create(
@@ -188,17 +213,18 @@ def run_conversation(question: str, history: List[ChatTurn], filename: str) -> d
             max_tokens=2000,
             system=SYSTEM_PROMPT,
             tools=[SEARCH_TOOL],
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
             messages=messages,
         )
 
         if response.stop_reason != "tool_use":
-            answer = "".join(
-                block.text for block in response.content if block.type == "text"
-            )
+            answer = "".join(block.text for block in response.content if block.type == "text")
             return {
                 "received": answer,
                 "searches": searches,
                 "searched": len(searches) > 0,
+                "tokens_used": tokens_used_total,
+                "total_tokens": paper_total_tokens,
             }
 
         messages.append({"role": "assistant", "content": response.content})
@@ -212,13 +238,15 @@ def run_conversation(question: str, history: List[ChatTurn], filename: str) -> d
             searches.append(query)
             print(f"[/ask] search_paper: {query}", flush=True)
 
-            chunks = retrieve_chunks(query, filename)
+            retrieval = retrieve_chunks(query, filename)
+            tokens_used_total += retrieval["tokens_used"]
+            paper_total_tokens = retrieval["total_tokens"]
+
             result_text = (
-                "\n\n---\n\n".join(chunks)
-                if chunks
+                "\n\n---\n\n".join(retrieval["chunks"])
+                if retrieval["chunks"]
                 else "No passages found for that query."
             )
-
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -236,4 +264,10 @@ def run_conversation(question: str, history: List[ChatTurn], filename: str) -> d
         messages=messages,
     )
     answer = "".join(block.text for block in response.content if block.type == "text")
-    return {"received": answer, "searches": searches, "searched": True}
+    return {
+        "received": answer,
+        "searches": searches,
+        "searched": True,
+        "tokens_used": tokens_used_total,
+        "total_tokens": paper_total_tokens,
+    }
